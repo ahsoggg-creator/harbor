@@ -14,6 +14,10 @@ downloaded, launched, updated and removed with one button. Think of an app store
 - **Automatic list.** Your repositories and their latest releases are fetched at start-up and on a timer (every
   10 minutes by default, `F5` for now). New repositories and releases are written to the log. Requests are conditional
   (ETag), so they barely touch the GitHub API rate limit.
+- **Already installed on this PC.** Harbor finds programs of your repositories by itself: through Windows "Apps &
+  features" (registry, repository link or name) and the `Programs`, `Program Files`, Downloads and Desktop folders.
+  It shows the version and path, compares it with the latest release ("on PC 0.5.0, v0.8.0 available") and offers
+  Run, Folder and "Delete program" (the standard uninstaller). Read-only: nothing is started on its own.
 - **Download.** Progress and cancel; when a release has several files you pick one (the installer by default). If the
   release ships `SHA256SUMS.txt` the hash is verified and a mismatching file is never kept. Repositories without
   releases offer "Download source" (zip).

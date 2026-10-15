@@ -103,6 +103,15 @@ pub struct Installed {
     pub at: i64,
 }
 
+/// A program of one of the repositories that is already on this PC (found by a scan, not downloaded by Harbor).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Detected {
+    pub path: PathBuf,
+    pub version: Option<String>,
+    pub source: &'static str,
+    pub uninstall: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -158,12 +167,20 @@ pub struct State {
     pub first_seen: BTreeMap<String, i64>,
     pub log: Vec<LogEntry>,
     pub last_sync: i64,
+    #[serde(skip)]
+    pub detected: BTreeMap<String, Detected>,
 }
 
 impl State {
     pub fn update_available(&self, repo: &Repo) -> bool {
-        match (self.installed.get(&repo.key()), &repo.release) {
+        let key = repo.key();
+        match (self.installed.get(&key), &repo.release) {
             (Some(i), Some(r)) => i.tag != SOURCE_TAG && i.tag != r.tag,
+            (None, Some(r)) => self
+                .detected
+                .get(&key)
+                .and_then(|d| d.version.as_deref())
+                .is_some_and(|v| crate::update::is_newer(&r.tag, v)),
             _ => false,
         }
     }

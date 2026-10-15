@@ -1,9 +1,12 @@
 use crate::github::{self, Client, EtagCache, Progress, SyncResult, Target};
-use crate::model::{self, Installed, Repo, SOURCE_TAG, State, ago_iso, ago_secs, clock, human_size, now, repo_dir};
+use crate::model::{
+    self, Detected, Installed, Repo, SOURCE_TAG, State, ago_iso, ago_secs, clock, human_size, now, repo_dir,
+};
+use crate::scan;
 use crate::theme;
 use crate::update;
 use eframe::egui::{self, Color32, RichText, Ui};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -21,6 +24,7 @@ enum Msg {
         result: Result<Installed, String>,
     },
     SelfUpdated(Result<(), String>),
+    Scanned(BTreeMap<String, Detected>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -55,7 +59,7 @@ impl Filter {
         match self {
             Filter::All => "Все",
             Filter::WithRelease => "С релизом",
-            Filter::Downloaded => "Скачанные",
+            Filter::Downloaded => "Установленные",
             Filter::Updates => "Есть обновление",
             Filter::Favorites => "Избранные",
             Filter::Private => "Приватные",
@@ -88,6 +92,7 @@ impl Sort {
 
 enum Confirm {
     DeleteFiles(String),
+    Uninstall(String),
     WipeAll,
 }
 
@@ -97,6 +102,7 @@ enum Action {
     Run(String),
     Reveal(String),
     Delete(String),
+    Uninstall(String),
     Hide(String),
     Unhide(String),
     RemoveManual(String),
@@ -135,6 +141,8 @@ pub struct App {
     add_text: String,
     show_add: bool,
     toast: Option<(String, bool, Instant)>,
+    scan_requested: bool,
+    scanning: bool,
     update: Option<update::Available>,
     updating: Option<Arc<Progress>>,
     shot: Option<Shot>,
@@ -180,6 +188,8 @@ impl App {
             add_text: String::new(),
             show_add: false,
             toast: None,
+            scan_requested: true,
+            scanning: false,
             update: None,
             updating: None,
             shot,
@@ -217,6 +227,18 @@ impl App {
             let (token, _) = github::resolve_token(&settings);
             let client = Client::new(token, etags, rate);
             let _ = tx.send(Msg::Synced(github::sync(&client, &settings, &manual, &prev)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_scan(&mut self, ctx: &egui::Context) {
+        self.scan_requested = false;
+        self.scanning = true;
+        let repos = self.st.repos.clone();
+        let dir = self.st.settings.download_dir.clone();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Scanned(scan::scan(&repos, &dir)));
             ctx.request_repaint();
         });
     }
@@ -324,6 +346,21 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Synced(res) => self.on_synced(ctx, res),
+                Msg::Scanned(found) => {
+                    self.scanning = false;
+                    let fresh: Vec<String> = found
+                        .iter()
+                        .filter(|(k, _)| !self.st.detected.contains_key(*k))
+                        .map(|(k, d)| format!("Найдено на ПК: {k} {}", d.version.as_deref().unwrap_or("")))
+                        .collect();
+                    self.st.detected = found;
+                    if !self.st.repos.is_empty() && !fresh.is_empty() {
+                        for f in fresh {
+                            self.st.push_log(f.trim().to_string());
+                        }
+                        self.save();
+                    }
+                }
                 Msg::SelfUpdated(res) => {
                     self.updating = None;
                     match res {
@@ -349,6 +386,9 @@ impl App {
                     }
                 }
             }
+        }
+        if self.scan_requested && !self.scanning && !self.st.repos.is_empty() {
+            self.start_scan(ctx);
         }
         let interval = Duration::from_secs(60 * u64::from(self.st.settings.refresh_minutes.max(1)));
         if !self.syncing && self.last_try.is_none_or(|t| t.elapsed() >= interval) {
@@ -390,7 +430,7 @@ impl App {
                     if let (Some(old), Some(new)) = (old, &repo.release)
                         && old != new.tag
                     {
-                        logs.push(format!("Новый релиз {key}: {old} → {}", new.tag));
+                        logs.push(format!("Новый релиз {key}: {old} -> {}", new.tag));
                     }
                 }
                 for l in logs {
@@ -401,6 +441,7 @@ impl App {
                     self.st.repos.retain(|x| !x.private);
                 }
                 self.update = update::find(&self.st.repos);
+                self.scan_requested = true;
                 self.st.installed.retain(|_, i| i.path.exists());
                 self.st.last_sync = now();
                 self.save();
@@ -430,10 +471,22 @@ impl App {
                             self.st.installed.remove(&key);
                             self.say(format!("{key}: файл больше не существует"), true);
                         }
+                    } else if let Some(d) = self.st.detected.get(&key).cloned() {
+                        if d.path.exists() {
+                            shell_open(&d.path);
+                        } else {
+                            self.scan_requested = true;
+                            self.say(format!("{key}: программа больше не найдена"), true);
+                        }
                     }
                 }
                 Action::Reveal(key) => {
-                    let dir = self.st.installed.get(&key).map(|i| i.path.clone());
+                    let dir = self
+                        .st
+                        .installed
+                        .get(&key)
+                        .map(|i| i.path.clone())
+                        .or_else(|| self.st.detected.get(&key).map(|d| d.path.clone()));
                     match dir {
                         Some(p) if p.exists() => reveal(&p),
                         _ => {
@@ -445,6 +498,7 @@ impl App {
                     }
                 }
                 Action::Delete(key) => self.confirm = Some(Confirm::DeleteFiles(key)),
+                Action::Uninstall(key) => self.confirm = Some(Confirm::Uninstall(key)),
                 Action::Hide(key) => {
                     self.st.hidden.insert(key.clone());
                     self.say(format!("«{key}» убран из списка (фильтр «Скрытые» вернёт его)"), false);
@@ -544,7 +598,7 @@ impl App {
                 let pass = match self.filter {
                     Filter::All | Filter::Hidden => true,
                     Filter::WithRelease => r.release.is_some(),
-                    Filter::Downloaded => self.st.installed.contains_key(&key),
+                    Filter::Downloaded => self.st.installed.contains_key(&key) || self.st.detected.contains_key(&key),
                     Filter::Updates => self.st.update_available(r),
                     Filter::Favorites => self.st.favorites.contains(&key),
                     Filter::Private => r.private,
@@ -663,6 +717,9 @@ impl App {
                     format!("Скачано: {} ({})", self.st.installed.len(), human_size(disk)),
                     theme::GOOD,
                 );
+                if !self.st.detected.is_empty() {
+                    stat(ui, format!("Найдено на ПК: {}", self.st.detected.len()), theme::BLUE);
+                }
                 if updates > 0 {
                     stat(ui, format!("Обновлений: {updates}"), theme::WARN);
                 }
@@ -755,8 +812,8 @@ impl App {
     fn card(&self, ui: &mut Ui, repo: &Repo, actions: &mut Vec<Action>) {
         let key = repo.key();
         let installed = self.st.installed.get(&key);
+        let detected = self.st.detected.get(&key);
         let upd = self.st.update_available(repo);
-        let hidden = self.st.hidden.contains(&key);
         let fav = self.st.favorites.contains(&key);
         let is_new = self
             .st
@@ -843,13 +900,22 @@ impl App {
             if let Some(i) = installed {
                 let (text, color) = if upd {
                     let new = repo.release.as_ref().map(|r| r.tag.as_str()).unwrap_or("");
-                    (format!("Скачано {} → доступно {new}", i.tag), theme::WARN)
+                    (format!("Скачано {}, доступно {new}", i.tag), theme::WARN)
                 } else if i.tag == SOURCE_TAG {
                     (format!("Скачаны исходники · {}", human_size(i.size)), theme::GOOD)
                 } else {
                     (format!("Скачано {} · {}", i.tag, human_size(i.size)), theme::GOOD)
                 };
                 ui.label(RichText::new(text).small().strong().color(color));
+            }
+            if let Some(d) = detected {
+                let ver = d.version.as_deref().unwrap_or("версия неизвестна");
+                let (text, color) = match (&repo.release, upd) {
+                    (Some(r), true) => (format!("На ПК {ver}, доступно {}", r.tag), theme::WARN),
+                    _ => (format!("Установлено на ПК · {ver} · {}", d.source), theme::GOOD),
+                };
+                ui.label(RichText::new(text).small().strong().color(color))
+                    .on_hover_text(d.path.display().to_string());
             }
             if let Some(rel) = &repo.release
                 && !rel.notes.trim().is_empty()
@@ -885,23 +951,19 @@ impl App {
                 });
                 return;
             }
-            self.card_buttons(ui, repo, installed, upd, hidden, actions);
+            self.card_buttons(ui, repo, actions);
         });
     }
 
-    fn card_buttons(
-        &self,
-        ui: &mut Ui,
-        repo: &Repo,
-        installed: Option<&Installed>,
-        upd: bool,
-        hidden: bool,
-        actions: &mut Vec<Action>,
-    ) {
+    fn card_buttons(&self, ui: &mut Ui, repo: &Repo, actions: &mut Vec<Action>) {
         let key = repo.key();
+        let installed = self.st.installed.get(&key);
+        let detected = self.st.detected.get(&key);
+        let upd = self.st.update_available(repo);
+        let hidden = self.st.hidden.contains(&key);
         ui.horizontal_wrapped(|ui| {
             let assets = repo.release.as_ref().map(|r| r.downloadable()).unwrap_or_default();
-            let have_file = installed.is_some();
+            let have_file = installed.is_some() || detected.is_some();
             if let Some(rel) = &repo.release
                 && !assets.is_empty()
             {
@@ -941,13 +1003,25 @@ impl App {
             } else if !have_file && theme::primary_button(ui, "Скачать исходники").clicked() {
                 actions.push(Action::Download(key.clone(), Target::Source));
             }
+            if installed.is_none()
+                && let Some(d) = detected
+            {
+                if ui.button(run_label(&d.path)).clicked() {
+                    actions.push(Action::Run(key.clone()));
+                }
+                if ui.button("Папка").clicked() {
+                    actions.push(Action::Reveal(key.clone()));
+                }
+                if d.uninstall.is_some()
+                    && theme::danger_button(ui, "Удалить программу")
+                        .on_hover_text("Запустить штатный деинсталлятор Windows")
+                        .clicked()
+                {
+                    actions.push(Action::Uninstall(key.clone()));
+                }
+            }
             if let Some(i) = installed {
-                let ext = i.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                let run = if matches!(ext.as_str(), "exe" | "msi") {
-                    "Запустить"
-                } else {
-                    "Открыть"
-                };
+                let run = run_label(&i.path);
                 if ui.button(run).clicked() {
                     actions.push(Action::Run(key.clone()));
                 }
@@ -1091,6 +1165,10 @@ impl App {
                     ctx.copy_text(self.markdown_list());
                     self.toast = Some(("Список скопирован".into(), false, Instant::now()));
                 }
+                if ui.button("Найти установленные на ПК").clicked() {
+                    self.scan_requested = true;
+                    self.toast = Some(("Ищу установленные программы…".into(), false, Instant::now()));
+                }
                 if ui.button("Сбросить кэш GitHub").clicked() {
                     if let Ok(mut c) = self.etags.lock() {
                         c.clear();
@@ -1154,6 +1232,23 @@ impl App {
                     ),
                 )
             }
+            Confirm::Uninstall(k) => {
+                let cmd = self
+                    .st
+                    .detected
+                    .get(k)
+                    .and_then(|d| d.uninstall.clone())
+                    .unwrap_or_default();
+                (
+                    "Удалить программу?",
+                    format!(
+                        "Будет запущен деинсталлятор Windows:
+{cmd}
+
+Это удалит программу с компьютера."
+                    ),
+                )
+            }
             Confirm::WipeAll => (
                 "Удалить всё скачанное?",
                 format!(
@@ -1177,6 +1272,15 @@ impl App {
         if yes {
             match self.confirm.take() {
                 Some(Confirm::DeleteFiles(k)) => self.delete_files(&k),
+                Some(Confirm::Uninstall(k)) => {
+                    if let Some(cmd) = self.st.detected.get(&k).and_then(|d| d.uninstall.clone()) {
+                        run_uninstaller(&cmd);
+                        self.say(
+                            format!("Запущено удаление {k}; нажми «Найти на ПК» в настройках, когда закончится"),
+                            false,
+                        );
+                    }
+                }
                 Some(Confirm::WipeAll) => {
                     let keys: Vec<String> = self.st.installed.keys().cloned().collect();
                     for k in keys {
@@ -1257,6 +1361,22 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}…", flat.chars().take(max).collect::<String>())
     }
+}
+
+fn run_label(path: &Path) -> &'static str {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if matches!(ext.as_str(), "exe" | "msi") {
+        "Запустить"
+    } else {
+        "Открыть"
+    }
+}
+
+fn run_uninstaller(command: &str) {
+    let _ = std::process::Command::new("cmd.exe")
+        .raw_arg(format!("/C \"{command}\""))
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
 }
 
 fn shell_open(path: &Path) {

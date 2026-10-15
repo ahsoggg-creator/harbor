@@ -66,6 +66,11 @@ fn base64(data: &[u8]) -> String {
 }
 
 fn powershell(script: &str) -> Result<(), String> {
+    powershell_output(script).map(|_| ())
+}
+
+/// Runs a script and returns its stdout decoded as UTF-8 (scripts that print text set the console encoding).
+pub fn powershell_output(script: &str) -> Result<String, String> {
     let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let out = run_hidden(Command::new("powershell.exe").args([
         "-NoProfile",
@@ -75,10 +80,11 @@ fn powershell(script: &str) -> Result<(), String> {
         "-EncodedCommand",
         &base64(&utf16),
     ]))?;
-    out.status
-        .success()
-        .then_some(())
-        .ok_or_else(|| String::from_utf8_lossy(&out.stderr).trim().to_string())
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
 }
 
 fn shortcut_script(exe: &Path, desktop: bool) -> String {

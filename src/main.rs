@@ -4,6 +4,7 @@ mod app;
 mod github;
 mod installer;
 mod model;
+mod scan;
 mod theme;
 mod update;
 mod winint;
